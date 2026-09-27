@@ -1111,5 +1111,358 @@ class ReceiptReconcileApiTests(unittest.TestCase):
         )
 
 
+class SeatPlanApiTests(unittest.TestCase):
+    PAYLOAD = {
+        "station_count": 4,
+        "seat_count": 2,
+        "passengers": [
+            {"id": "a", "board": 0, "alight": 2, "allowed_seats": [1, 2]},
+            {"id": "b", "board": 1, "alight": 3, "allowed_seats": [1, 2]},
+        ],
+    }
+
+    def test_overlapping_rides_get_different_seats(self):
+        resp = client.post("/seat-plan", json=self.PAYLOAD)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(
+            resp.json()["assignments"],
+            [{"id": "a", "seat": 1}, {"id": "b", "seat": 2}],
+        )
+
+    def test_alighting_station_frees_the_seat(self):
+        payload = {
+            "station_count": 2,
+            "seat_count": 1,
+            "passengers": [
+                {"id": "a", "board": 0, "alight": 1, "allowed_seats": [1]},
+                {"id": "b", "board": 1, "alight": 2, "allowed_seats": [1]},
+            ],
+        }
+        resp = client.post("/seat-plan", json=payload)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(
+            resp.json()["assignments"],
+            [{"id": "a", "seat": 1}, {"id": "b", "seat": 1}],
+        )
+
+    def test_blocked_seat_is_unavailable_only_on_its_interval(self):
+        # Seat 1 blocked on [1,2): b (rides [0,1)) keeps it; a (rides
+        # [0,2)) must move to seat 2.
+        payload = {
+            "station_count": 2,
+            "seat_count": 2,
+            "passengers": [
+                {"id": "a", "board": 0, "alight": 2, "allowed_seats": [1, 2]},
+                {"id": "b", "board": 0, "alight": 1, "allowed_seats": [1, 2]},
+            ],
+            "blocked": [{"seat": 1, "board": 1, "alight": 2}],
+        }
+        resp = client.post("/seat-plan", json=payload)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(
+            resp.json()["assignments"],
+            [{"id": "a", "seat": 2}, {"id": "b", "seat": 1}],
+        )
+
+    def test_blocked_interval_ends_at_alight_is_usable(self):
+        # Blocked [0,1) does not touch a ride starting at station 1.
+        payload = {
+            "station_count": 2,
+            "seat_count": 1,
+            "passengers": [
+                {"id": "a", "board": 1, "alight": 2, "allowed_seats": [1]}
+            ],
+            "blocked": [{"seat": 1, "board": 0, "alight": 1}],
+        }
+        resp = client.post("/seat-plan", json=payload)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json()["assignments"], [{"id": "a", "seat": 1}])
+
+    def test_allowed_seats_limit_choices(self):
+        payload = {
+            "station_count": 2,
+            "seat_count": 2,
+            "passengers": [
+                {"id": "a", "board": 0, "alight": 2, "allowed_seats": [1, 2]},
+                {"id": "b", "board": 0, "alight": 2, "allowed_seats": [2]},
+            ],
+        }
+        resp = client.post("/seat-plan", json=payload)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(
+            resp.json()["assignments"],
+            [{"id": "a", "seat": 1}, {"id": "b", "seat": 2}],
+        )
+
+    def test_no_feasible_plan_is_409(self):
+        payload = {
+            "station_count": 2,
+            "seat_count": 1,
+            "passengers": [
+                {"id": "a", "board": 0, "alight": 2, "allowed_seats": [1]},
+                {"id": "b", "board": 0, "alight": 1, "allowed_seats": [1]},
+            ],
+        }
+        resp = client.post("/seat-plan", json=payload)
+        self.assertEqual(resp.status_code, 409)
+        self.assertIn("no feasible seat plan", resp.text)
+
+    def test_all_allowed_seats_blocked_is_409(self):
+        payload = {
+            "station_count": 2,
+            "seat_count": 1,
+            "passengers": [
+                {"id": "a", "board": 0, "alight": 2, "allowed_seats": [1]}
+            ],
+            "blocked": [{"seat": 1, "board": 0, "alight": 2}],
+        }
+        self.assertEqual(client.post("/seat-plan", json=payload).status_code, 409)
+
+    def test_lex_min_needs_lookahead(self):
+        # Greedily seating the first passenger in seat 1 deadlocks; the
+        # lex-min complete plan moves them to seat 2.
+        payload = {
+            "station_count": 3,
+            "seat_count": 2,
+            "passengers": [
+                {"id": "a", "board": 0, "alight": 3, "allowed_seats": [1, 2]},
+                {"id": "b", "board": 0, "alight": 1, "allowed_seats": [1]},
+                {"id": "c", "board": 1, "alight": 2, "allowed_seats": [1]},
+            ],
+        }
+        resp = client.post("/seat-plan", json=payload)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(
+            resp.json()["assignments"],
+            [{"id": "a", "seat": 2},
+             {"id": "b", "seat": 1},
+             {"id": "c", "seat": 1}],
+        )
+
+    def test_response_uses_canonical_id_order(self):
+        payload = {
+            "station_count": 2,
+            "seat_count": 6,
+            "passengers": [
+                {"id": "z", "board": 0, "alight": 1, "allowed_seats": [1]},
+                {"id": 10, "board": 0, "alight": 1, "allowed_seats": [2]},
+                {"id": 2, "board": 0, "alight": 1, "allowed_seats": [3]},
+            ],
+        }
+        resp = client.post("/seat-plan", json=payload)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(
+            [a["id"] for a in resp.json()["assignments"]], [2, 10, "z"]
+        )
+
+    def test_input_order_does_not_matter(self):
+        reversed_payload = dict(
+            self.PAYLOAD,
+            passengers=list(reversed(self.PAYLOAD["passengers"])),
+        )
+        r1 = client.post("/seat-plan", json=self.PAYLOAD)
+        r2 = client.post("/seat-plan", json=reversed_payload)
+        self.assertEqual(r1.status_code, r2.status_code)
+        self.assertEqual(r1.json(), r2.json())
+
+    def test_duplicate_entries_in_allowed_seats_are_ok(self):
+        payload = {
+            "station_count": 2,
+            "seat_count": 2,
+            "passengers": [
+                {"id": "a", "board": 0, "alight": 1, "allowed_seats": [1, 1, 2]}
+            ],
+        }
+        resp = client.post("/seat-plan", json=payload)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json()["assignments"], [{"id": "a", "seat": 1}])
+
+    def test_bad_interval_is_422(self):
+        payload = {
+            "station_count": 2,
+            "seat_count": 1,
+            "passengers": [
+                {"id": "a", "board": 1, "alight": 1, "allowed_seats": [1]}
+            ],
+        }
+        resp = client.post("/seat-plan", json=payload)
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("invalid interval", resp.text)
+
+    def test_station_out_of_range_is_422(self):
+        payload = {
+            "station_count": 2,
+            "seat_count": 1,
+            "passengers": [
+                {"id": "a", "board": 0, "alight": 3, "allowed_seats": [1]}
+            ],
+        }
+        resp = client.post("/seat-plan", json=payload)
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("out of range", resp.text)
+
+    def test_duplicate_passenger_id_is_422(self):
+        payload = {
+            "station_count": 2,
+            "seat_count": 2,
+            "passengers": [
+                {"id": "a", "board": 0, "alight": 1, "allowed_seats": [1]},
+                {"id": "a", "board": 1, "alight": 2, "allowed_seats": [2]},
+            ],
+        }
+        resp = client.post("/seat-plan", json=payload)
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("duplicate passenger id", resp.text)
+
+    def test_int_and_string_same_id_are_duplicates(self):
+        payload = {
+            "station_count": 2,
+            "seat_count": 2,
+            "passengers": [
+                {"id": 1, "board": 0, "alight": 1, "allowed_seats": [1]},
+                {"id": "1", "board": 1, "alight": 2, "allowed_seats": [2]},
+            ],
+        }
+        self.assertEqual(client.post("/seat-plan", json=payload).status_code, 422)
+
+    def test_allowed_seat_out_of_range_is_422(self):
+        payload = {
+            "station_count": 2,
+            "seat_count": 2,
+            "passengers": [
+                {"id": "a", "board": 0, "alight": 1, "allowed_seats": [3]}
+            ],
+        }
+        resp = client.post("/seat-plan", json=payload)
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("out of range", resp.text)
+
+    def test_empty_allowed_seats_is_422(self):
+        payload = {
+            "station_count": 2,
+            "seat_count": 2,
+            "passengers": [
+                {"id": "a", "board": 0, "alight": 1, "allowed_seats": []}
+            ],
+        }
+        self.assertEqual(client.post("/seat-plan", json=payload).status_code, 422)
+
+    def test_missing_allowed_seats_is_422(self):
+        payload = {
+            "station_count": 2,
+            "seat_count": 2,
+            "passengers": [{"id": "a", "board": 0, "alight": 1}],
+        }
+        self.assertEqual(client.post("/seat-plan", json=payload).status_code, 422)
+
+    def test_zero_allowed_seat_is_422(self):
+        payload = {
+            "station_count": 2,
+            "seat_count": 2,
+            "passengers": [
+                {"id": "a", "board": 0, "alight": 1, "allowed_seats": [0]}
+            ],
+        }
+        self.assertEqual(client.post("/seat-plan", json=payload).status_code, 422)
+
+    def test_blocked_seat_out_of_range_is_422(self):
+        payload = {
+            "station_count": 2,
+            "seat_count": 1,
+            "passengers": [
+                {"id": "a", "board": 0, "alight": 1, "allowed_seats": [1]}
+            ],
+            "blocked": [{"seat": 2, "board": 0, "alight": 1}],
+        }
+        self.assertEqual(client.post("/seat-plan", json=payload).status_code, 422)
+
+    def test_blocked_bad_interval_is_422(self):
+        payload = {
+            "station_count": 2,
+            "seat_count": 1,
+            "passengers": [
+                {"id": "a", "board": 0, "alight": 1, "allowed_seats": [1]}
+            ],
+            "blocked": [{"seat": 1, "board": 1, "alight": 1}],
+        }
+        self.assertEqual(client.post("/seat-plan", json=payload).status_code, 422)
+
+    def test_blocked_station_out_of_range_is_422(self):
+        payload = {
+            "station_count": 2,
+            "seat_count": 1,
+            "passengers": [
+                {"id": "a", "board": 0, "alight": 1, "allowed_seats": [1]}
+            ],
+            "blocked": [{"seat": 1, "board": 0, "alight": 3}],
+        }
+        self.assertEqual(client.post("/seat-plan", json=payload).status_code, 422)
+
+    def test_station_count_bounds_are_422(self):
+        for station_count in (0, 1, 31, -2):
+            payload = {
+                "station_count": station_count,
+                "seat_count": 1,
+                "passengers": [
+                    {"id": "a", "board": 0, "alight": 1, "allowed_seats": [1]}
+                ],
+            }
+            self.assertEqual(
+                client.post("/seat-plan", json=payload).status_code,
+                422,
+                station_count,
+            )
+
+    def test_seat_count_bounds_are_422(self):
+        for seat_count in (0, 7, -1):
+            payload = {
+                "station_count": 2,
+                "seat_count": seat_count,
+                "passengers": [
+                    {"id": "a", "board": 0, "alight": 1, "allowed_seats": [1]}
+                ],
+            }
+            self.assertEqual(
+                client.post("/seat-plan", json=payload).status_code,
+                422,
+                seat_count,
+            )
+
+    def test_passenger_count_bounds_are_422(self):
+        too_many = {
+            "station_count": 2,
+            "seat_count": 6,
+            "passengers": [
+                {"id": i, "board": 0, "alight": 1, "allowed_seats": [1]}
+                for i in range(11)
+            ],
+        }
+        self.assertEqual(client.post("/seat-plan", json=too_many).status_code, 422)
+        empty = {"station_count": 2, "seat_count": 6, "passengers": []}
+        self.assertEqual(client.post("/seat-plan", json=empty).status_code, 422)
+
+    def test_unknown_field_is_422(self):
+        payload = dict(self.PAYLOAD, currency="usd")
+        self.assertEqual(client.post("/seat-plan", json=payload).status_code, 422)
+
+    def test_non_integer_counts_are_422(self):
+        for field, value in (("station_count", 2.5), ("seat_count", True)):
+            payload = dict(self.PAYLOAD)
+            payload[field] = value
+            self.assertEqual(
+                client.post("/seat-plan", json=payload).status_code, 422, field
+            )
+
+    def test_original_endpoints_unchanged(self):
+        self.assertEqual(client.get("/healthz").status_code, 200)
+        resp = client.post(
+            "/split",
+            json={"segments": [10],
+                  "passengers": [{"id": "a", "board": 0, "alight": 1}]},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["totals"], {"a": 10})
+
+
 if __name__ == "__main__":
     unittest.main()

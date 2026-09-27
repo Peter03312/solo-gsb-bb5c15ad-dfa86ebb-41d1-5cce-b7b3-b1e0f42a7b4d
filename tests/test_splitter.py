@@ -15,6 +15,7 @@ from app.splitter import (
     _triple,
     admit_passengers,
     fare_envelope,
+    plan_seats,
     reconcile_receipts,
     revision_impact,
     settle_balances,
@@ -33,6 +34,15 @@ def cand(pid, board, alight, max_fare):
 
 def receipt(rid, amount, segments):
     return P(id=rid, amount=amount, segments=segments)
+
+
+def seat(pid, board, alight, allowed_seats):
+    return P(id=pid, board=board, alight=alight,
+             allowed_seats=list(allowed_seats))
+
+
+def block(s, board, alight):
+    return P(seat=s, board=board, alight=alight)
 
 
 class SplitFaresTests(unittest.TestCase):
@@ -869,6 +879,199 @@ class ReconcileReceiptsTests(unittest.TestCase):
                     sum(amount_by_id[rid] for rid in segment_receipts[j]), cost
                 )
         self.assertGreater(feasible, 100)
+
+
+class PlanSeatsTests(unittest.TestCase):
+    def test_non_overlapping_rides_share_one_seat(self):
+        # Chain on a single seat: the alighting passenger frees the seat at
+        # the station, so the next may take it immediately.
+        result = plan_seats(3, 1, [
+            seat("a", 0, 1, [1]),
+            seat("b", 1, 2, [1]),
+            seat("c", 2, 3, [1]),
+        ], [])
+        self.assertEqual(result, [("a", 1), ("b", 1), ("c", 1)])
+
+    def test_overlapping_rides_take_different_seats(self):
+        result = plan_seats(4, 2, [
+            seat("a", 0, 2, [1, 2]),
+            seat("b", 1, 3, [1, 2]),
+        ], [])
+        # [0,2) and [1,3) overlap on segment 1 -> a=1, b=2.
+        self.assertEqual(result, [("a", 1), ("b", 2)])
+
+    def test_touching_rides_are_not_overlapping(self):
+        # [0,1) and [1,2) only meet at a station: same seat allowed.
+        result = plan_seats(2, 1, [
+            seat("b", 1, 2, [1]),
+            seat("a", 0, 1, [1]),
+        ], [])
+        self.assertEqual(result, [("a", 1), ("b", 1)])
+
+    def test_allowed_seats_restrict_choice(self):
+        # Only seat 2 is legal for b, so a takes 1 despite ties elsewhere.
+        result = plan_seats(2, 2, [
+            seat("a", 0, 2, [1, 2]),
+            seat("b", 0, 2, [2]),
+        ], [])
+        self.assertEqual(result, [("a", 1), ("b", 2)])
+
+    def test_blocked_seat_forces_other_seat(self):
+        # Seat 1 is blocked on segment 1: b (rides [0,1)) may take it, a
+        # (rides [0,2)) must take seat 2.
+        result = plan_seats(2, 2, [
+            seat("a", 0, 2, [1, 2]),
+            seat("b", 0, 1, [1, 2]),
+        ], [block(1, 1, 2)])
+        self.assertEqual(result, [("a", 2), ("b", 1)])
+
+    def test_block_outside_ride_has_no_effect(self):
+        # Blocked [0,1) does not touch a ride on [1,2) (alight is exclusive).
+        result = plan_seats(2, 1, [seat("a", 1, 2, [1])],
+                            [block(1, 0, 1)])
+        self.assertEqual(result, [("a", 1)])
+
+    def test_block_covering_whole_ride_makes_infeasible(self):
+        result = plan_seats(2, 1, [seat("a", 0, 2, [1])],
+                            [block(1, 0, 2)])
+        self.assertIsNone(result)
+
+    def test_no_seat_left_is_infeasible(self):
+        result = plan_seats(2, 1, [
+            seat("a", 0, 2, [1]),
+            seat("b", 0, 1, [1]),
+        ], [])
+        self.assertIsNone(result)
+
+    def test_lex_min_needs_lookahead(self):
+        # Greedily seating a in 1 deadlocks (b and c both must have 1 on
+        # different segments a covers); the lex-min complete plan puts a in 2.
+        result = plan_seats(3, 2, [
+            seat("a", 0, 3, [1, 2]),
+            seat("b", 0, 1, [1]),
+            seat("c", 1, 2, [1]),
+        ], [])
+        self.assertEqual(result, [("a", 2), ("b", 1), ("c", 1)])
+
+    def test_lex_min_prefers_smaller_sequence_globally(self):
+        # a rides the whole trip; b rides [1,3); c rides [0,1). On segment 1
+        # a and b must split seats (a=1, b=2); c overlaps a (but not b) on
+        # segment 0, so c cannot take 1 and the lex-min sequence is (1,2,2).
+        result = plan_seats(3, 2, [
+            seat("a", 0, 3, [1, 2]),
+            seat("b", 1, 3, [1, 2]),
+            seat("c", 0, 1, [1, 2]),
+        ], [])
+        self.assertEqual(result, [("a", 1), ("b", 2), ("c", 2)])
+
+    def test_canonical_id_order_integers_then_strings(self):
+        result = plan_seats(2, 6, [
+            seat("z", 0, 1, [4]),
+            seat(2, 0, 1, [2]),
+            seat(10, 0, 1, [3]),
+        ], [])
+        self.assertEqual([pid for pid, _ in result], [2, 10, "z"])
+
+    def test_input_order_does_not_change_result(self):
+        passengers = [
+            seat("a", 0, 2, [1, 2]),
+            seat("b", 1, 3, [1, 2]),
+            seat("c", 0, 1, [1]),
+        ]
+        expected = plan_seats(4, 2, passengers, [])
+        for perm in permutations(passengers):
+            self.assertEqual(plan_seats(4, 2, list(perm), []), expected)
+
+    def test_duplicate_allowed_seat_entries_are_harmless(self):
+        result = plan_seats(2, 2, [seat("a", 0, 1, [2, 2, 1])], [])
+        self.assertEqual(result, [("a", 1)])
+
+    def test_empty_roster(self):
+        self.assertEqual(plan_seats(2, 2, [], []), [])
+
+    def test_single_passenger_gets_smallest_allowed(self):
+        result = plan_seats(30, 6, [seat("a", 0, 30, [3, 5, 1])], [])
+        self.assertEqual(result, [("a", 1)])
+
+
+class PlanSeatsPropertyTests(unittest.TestCase):
+    @staticmethod
+    def _brute(station_count, seat_count, passengers, blocked):
+        """Lexicographically smallest plan by exhaustive enumeration."""
+        ordered = sorted(passengers, key=lambda p: tie_key(p.id))
+        blocked_pairs = set()
+        for b in blocked:
+            for i in range(b.board, b.alight):
+                blocked_pairs.add((b.seat, i))
+        best = None
+
+        def recurse(k, chosen):
+            nonlocal best
+            if k == len(ordered):
+                if best is None or chosen < best:
+                    best = list(chosen)
+                return
+            p = ordered[k]
+            for s in sorted(set(p.allowed_seats)):
+                if any((s, i) in blocked_pairs
+                       for i in range(p.board, p.alight)):
+                    continue
+                clash = False
+                for j in range(k):
+                    q = ordered[j]
+                    if chosen[j] == s and max(p.board, q.board) < min(
+                        p.alight, q.alight
+                    ):
+                        clash = True
+                        break
+                if not clash:
+                    chosen.append(s)
+                    recurse(k + 1, chosen)
+                    chosen.pop()
+
+        recurse(0, [])
+        if best is None:
+            return None
+        return [(ordered[k].id, best[k]) for k in range(len(ordered))]
+
+    def test_matches_exhaustive_search(self):
+        import random
+        rng = random.Random(20260927)
+        feasible = infeasible = 0
+        for _ in range(400):
+            station_count = rng.randint(2, 6)
+            seat_count = rng.randint(1, 3)
+            n = rng.randint(1, 6)
+            passengers = []
+            for k in range(n):
+                board = rng.randint(0, station_count - 1)
+                alight = rng.randint(board + 1, station_count)
+                allowed = rng.sample(
+                    range(1, seat_count + 1),
+                    rng.randint(1, seat_count),
+                )
+                pid = k if k % 2 == 0 else f"s{k}"
+                passengers.append(seat(pid, board, alight, allowed))
+            blocked = [
+                block(rng.randint(1, seat_count),
+                      rng.randint(0, station_count - 1),
+                      rng.randint(1, station_count))
+                for _ in range(rng.randint(0, 2))
+            ]
+            blocked = [b for b in blocked if b.board < b.alight]
+            expected = self._brute(
+                station_count, seat_count, passengers, blocked
+            )
+            shuffled = list(passengers)
+            rng.shuffle(shuffled)
+            got = plan_seats(station_count, seat_count, shuffled, blocked)
+            self.assertEqual(got, expected, (passengers, blocked))
+            if expected is None:
+                infeasible += 1
+            else:
+                feasible += 1
+        self.assertGreater(feasible, 50)
+        self.assertGreater(infeasible, 20)
 
 
 if __name__ == "__main__":

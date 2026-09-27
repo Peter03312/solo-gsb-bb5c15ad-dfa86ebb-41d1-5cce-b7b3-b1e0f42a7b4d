@@ -8,7 +8,10 @@
 当行程中**恰有两段费用未定**时，在各自上下界与全程总价约束下求出目标乘客应付额的
 **精确最小/最大值**及完整费用见证（利用余数周期压缩搜索，绝不逐分遍历）；
 以及用**最多 12 张凭证核销**逐段费用（每张凭证整额归属唯一一个可归属路段，
-多方案时取字典序最小的归属序列），并同时给出逐人应付额。
+多方案时取字典序最小的归属序列），并同时给出逐人应付额；
+还可在指定站点数、座位数、每位乘客的允许座位与座位停用区间后，
+为 1～10 名乘客**安排全程固定座位**（区间重叠者不得同座、下车站立即换客，
+多方案时取座位编号序列字典序最小者，无座可排返回 409）。
 金额全程使用整数分与精确分数计算，总额严格守恒，且乘客、凭证与付款记录的输入顺序不影响结果。
 
 ## 快速启动
@@ -29,10 +32,11 @@ docker compose up --build
 | http://localhost:8000/revision-impact | 路段费用修订的边际影响归因接口（POST） |
 | http://localhost:8000/fare-envelope | 两段费用未定时的应付额包络接口（POST） |
 | http://localhost:8000/receipt-reconcile | 凭证整额核销 + 分摊接口（POST） |
+| http://localhost:8000/seat-plan | 全程固定座位安排接口（POST） |
 | http://localhost:8000/docs | Swagger 交互式文档（各 POST 接口可在此直接发请求） |
 | http://localhost:8000/healthz | 健康检查 |
 
-以上 `/split`、`/admit`、`/settle`、`/revision-impact`、`/fare-envelope`、`/receipt-reconcile` 均为 **POST** 接口，浏览器地址栏直接访问只适用于 GET；命令行可用下文的 `curl` 示例（带 `-d` 请求体即按 POST 发送），或打开 `/docs` 在页面上交互式调用。
+以上 `/split`、`/admit`、`/settle`、`/revision-impact`、`/fare-envelope`、`/receipt-reconcile`、`/seat-plan` 均为 **POST** 接口，浏览器地址栏直接访问只适用于 GET；命令行可用下文的 `curl` 示例（带 `-d` 请求体即按 POST 发送），或打开 `/docs` 在页面上交互式调用。
 
 后台运行可加 `-d`；停止用 `docker compose down`。
 
@@ -465,6 +469,100 @@ curl -s http://localhost:8000/receipt-reconcile \
   -d '{"segments":[100,251,80],"passengers":[{"id":"alice","board":0,"alight":3},{"id":"bob","board":1,"alight":3},{"id":"carol","board":0,"alight":1}],"receipts":[{"id":"R-251","amount":251,"segments":[1]},{"id":"R-100b","amount":40,"segments":[0,2]},{"id":"R-80a","amount":40,"segments":[0,2]},{"id":"R-80b","amount":40,"segments":[0,2]},{"id":"R-100a","amount":60,"segments":[0,2]}]}'
 ```
 
+## API：`POST /seat-plan`
+
+为每位乘客安排一个**全程固定座位**。与其他接口共用同一套乘客编号与上下车区间约定：
+站点为 `0..station_count`，乘客在车区间为半开区间 `[board, alight)`。
+
+- 每名乘客给出**非空**的允许座位列表 `allowed_seats`（座位编号 `1..seat_count`），
+  全程只能固定坐在其中一个座位上。
+- 可选的 `blocked` 列表描述座位停用：每项 `seat`、`board`、`alight` 表示该座位在
+  半开区间 `[board, alight)` 内停用（乘客乘坐的任一路段落入停用区间即不可用）。
+- **区间重叠的乘客不能同座**：`[b1, a1)` 与 `[b2, a2)` 当且仅当
+  `max(b1, b2) < min(a1, a2)` 时重叠。**下车站立即换客**——例如 `[0,1)` 与 `[1,2)`
+  只在站点 1 相接、不重叠，可以共用同一座位；停用区间同理，`[0,1)` 停用不影响
+  从站点 1 开始乘坐的乘客。
+
+全员都能安排时返回完整方案。乘客先按既有编号规则（整数 ID 按数值、字符串 ID 按字典序，
+整数排在字符串前）排序，再在所有可行完整方案中取**座位编号序列字典序最小**者，
+因此乘客与停用项的输入顺序都不影响结果。任何乘客都无法安排到「允许且未停用、
+且不与同座其他乘客重叠」的座位时，返回 **409 Conflict**（注意：409 是「合法但无解」，
+非法输入仍是 422）。
+
+### 请求体
+
+```json
+{
+  "station_count": 4,
+  "seat_count": 2,
+  "passengers": [
+    {"id": "alice", "board": 0, "alight": 2, "allowed_seats": [1, 2]},
+    {"id": "bob",   "board": 1, "alight": 3, "allowed_seats": [1]}
+  ],
+  "blocked": [
+    {"seat": 2, "board": 0, "alight": 1}
+  ]
+}
+```
+
+- `station_count`：站点数，**2～30** 的整数；站点编号 `0..station_count`。
+- `seat_count`：座位数，**1～6** 的整数；座位编号 `1..seat_count`。
+- `passengers`：**1～10 名**乘客。
+  - `id`：乘客 ID，字符串或整数，全程唯一（`1` 与 `"1"` 视为同一个 ID）。
+  - `board` / `alight`：上/下车站点，须满足 `0 ≤ board < alight ≤ station_count`。
+  - `allowed_seats`：**非空**允许座位列表，每个元素都在 `1..seat_count` 内；
+    列表内重复编号无害（按一个候选座位处理）。
+- `blocked`：可选（缺省为空数组）。每项中 `seat` 必须在 `1..seat_count` 内，
+  且同样要求 `0 ≤ board < alight ≤ station_count`；同一座位的多条停用区间可以并存。
+
+### 响应（200）
+
+```json
+{
+  "assignments": [
+    {"id": "alice", "seat": 2},
+    {"id": "bob", "seat": 1}
+  ]
+}
+```
+
+- `assignments`：每位乘客一项，`seat` 为其全程固定座位（1-based）；
+  列表按乘客 ID 的规范顺序排列（整数按数值、字符串按字典序，整数在前），
+  对应座位编号序列是所有可行完整方案中字典序最小的一个。
+
+### 无解（409）
+
+请求本身合法，但不存在让全员落座的完整方案（某人的允许座位在其乘坐区间内全部停用，
+或与区间重叠的乘客争座），例如只有 1 个座位而两名乘客的区间重叠：
+
+```json
+{"detail": "no feasible seat plan: ..."}
+```
+
+### 算法：字典序 DFS + MRV 可行性剪枝
+
+乘客按规范 ID 排序后，依次为其尝试编号从小到大的座位；每个候选都先用
+「最小剩余可选值（MRV）回溯」判定当前部分安排**是否能扩展成完整方案**，
+第一个能扩展成功的座位即构成字典序最小的完整座位序列。乘客至多 10 名、
+座位至多 6 个，搜索规模很小；停用区间与乘坐区间均以路段位掩码表示，
+重叠与停用判定都是一次按位与。
+
+### 示例
+
+```bash
+curl -s http://localhost:8000/seat-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"station_count":4,"seat_count":2,"passengers":[{"id":"alice","board":0,"alight":2,"allowed_seats":[1,2]},{"id":"bob","board":1,"alight":3,"allowed_seats":[1,2]}]}'
+```
+
+无解时观察 409：
+
+```bash
+curl -i http://localhost:8000/seat-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"station_count":2,"seat_count":1,"passengers":[{"id":"alice","board":0,"alight":2,"allowed_seats":[1]},{"id":"bob","board":0,"alight":1,"allowed_seats":[1]}]}'
+```
+
 ## 分摊规则
 
 1. 按路段顺序处理，每段找出全部在车乘客均摊：`base = cost // n`，余数 `r = cost % n`。
@@ -473,7 +571,7 @@ curl -s http://localhost:8000/receipt-reconcile \
    （整数 ID 按数值、字符串 ID 按字典序），除此之外 ID 不影响分摊。
 4. 因此：总额严格守恒（`sum(totals) == sum(segments)`），且乘客在请求中的排列顺序不影响结果。
 
-## 错误（422）
+## 错误（422 / 409）
 
 以下情况返回 `422 Unprocessable Entity`，响应 `detail` 中含具体原因：
 
@@ -496,7 +594,20 @@ curl -s http://localhost:8000/receipt-reconcile \
 - （仅 `/receipt-reconcile`）凭证的可归属路段下标越界（`>= 路段数` 或为负）；
 - （仅 `/receipt-reconcile`）凭证金额之和不等于行程总额；
 - （仅 `/receipt-reconcile`）总额虽相符，但不存在「每张凭证整额归属一个允许路段、
-  每段所获金额恰好等于其费用」的核销方案。
+  每段所获金额恰好等于其费用」的核销方案；
+- （仅 `/seat-plan`）`station_count` 不在 2～30、`seat_count` 不在 1～6，
+  或乘客人数不在 1～10；
+- （仅 `/seat-plan`）`allowed_seats` 为空、缺失或含 `1..seat_count` 之外的座位编号
+  （0、负数或越界）；
+- （仅 `/seat-plan`）`blocked` 项的座位越界，或其停用区间非法（`board >= alight`、
+  站点越界或为负）；
+- （仅 `/seat-plan`）乘客区间非法（`board >= alight`、`alight > station_count`）
+  或乘客 ID 重复。
+
+以下情况返回 `409 Conflict`（请求合法，但业务上无解）：
+
+- （仅 `/seat-plan`）不存在让全员落座的完整方案：某乘客的允许座位在其乘坐区间内
+  全部停用，或无法避免区间重叠的乘客同座。
 
 ## 本地开发与测试
 
@@ -512,9 +623,9 @@ uvicorn app.main:app --reload    # 本地起服务，默认 http://127.0.0.1:800
 
 ```
 app/
-  main.py       # FastAPI 应用与路由（POST /split、/admit、/settle、/revision-impact、/fare-envelope、/receipt-reconcile、GET /healthz）
+  main.py       # FastAPI 应用与路由（POST /split、/admit、/settle、/revision-impact、/fare-envelope、/receipt-reconcile、/seat-plan、GET /healthz）
   models.py     # 请求/响应模型与 422 校验规则
-  splitter.py   # 核心算法：分摊（精确分数）+ 候选遴选（子集枚举）+ 最少转账结清（子集 DP）+ 修订影响（Shapley 平均边际）+ 费用包络（余数周期压缩）+ 凭证核销（从左到右子集 DP）
+  splitter.py   # 核心算法：分摊（精确分数）+ 候选遴选（子集枚举）+ 最少转账结清（子集 DP）+ 修订影响（Shapley 平均边际）+ 费用包络（余数周期压缩）+ 凭证核销（从左到右子集 DP）+ 座位安排（字典序 DFS + MRV 剪枝）
 tests/          # 算法单元测试 + API 集成测试
 Dockerfile      # 依赖与启动命令均固化在镜像内
 compose.yaml    # 单服务编排，含健康检查

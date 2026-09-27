@@ -531,3 +531,112 @@ class ReceiptReconcileResponse(BaseModel):
         description="cents each passenger owes under the usual /split rules; "
                     "sums to total_cost"
     )
+
+
+class SeatPlanPassenger(Passenger):
+    """One passenger of a seat-plan request and the seats they may take."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    allowed_seats: List[PositiveInt] = Field(
+        min_length=1,
+        description="non-empty list of 1-based seat numbers the passenger may "
+                    "occupy; must stay within 1..seat_count",
+    )
+
+
+class SeatBlock(BaseModel):
+    """A seat taken out of service on the half-open interval [board, alight)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    seat: PositiveInt = Field(description="1-based seat number")
+    board: NonNegativeInt = Field(
+        description="first station index where the seat is blocked (inclusive)"
+    )
+    alight: NonNegativeInt = Field(
+        description="first station index where the seat is usable again (exclusive)"
+    )
+
+
+class SeatPlanRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    station_count: PositiveInt = Field(
+        ge=2,
+        le=30,
+        description="number of stations (2..30); stations are 0..station_count",
+    )
+    seat_count: PositiveInt = Field(
+        ge=1,
+        le=6,
+        description="number of seats (1..6), numbered 1..seat_count",
+    )
+    passengers: List[SeatPlanPassenger] = Field(
+        min_length=1,
+        max_length=10,
+        description="1..10 passengers; each keeps one fixed seat for the whole ride",
+    )
+    blocked: List[SeatBlock] = Field(
+        default_factory=list,
+        description="optional list of seat outages, each on [board, alight)",
+    )
+
+    @model_validator(mode="after")
+    def _check_seat_plan(self) -> "SeatPlanRequest":
+        n = self.station_count
+        seen = set()
+        for p in self.passengers:
+            key = str(p.id)
+            if key in seen:
+                raise ValueError(f"duplicate passenger id: {p.id!r}")
+            seen.add(key)
+            if p.board >= p.alight:
+                raise ValueError(
+                    f"passenger {p.id!r}: invalid interval board={p.board}, "
+                    f"alight={p.alight} (board must be < alight)"
+                )
+            if p.alight > n:
+                raise ValueError(
+                    f"passenger {p.id!r}: alight station {p.alight} is out of range; "
+                    f"a trip with {n} station(s) has stations 0..{n}"
+                )
+            for s in p.allowed_seats:
+                if s < 1 or s > self.seat_count:
+                    raise ValueError(
+                        f"passenger {p.id!r}: allowed seat {s} is out of range; "
+                        f"seats are numbered 1..{self.seat_count}"
+                    )
+        for b in self.blocked:
+            if b.seat < 1 or b.seat > self.seat_count:
+                raise ValueError(
+                    f"blocked seat {b.seat} is out of range; "
+                    f"seats are numbered 1..{self.seat_count}"
+                )
+            if b.board >= b.alight:
+                raise ValueError(
+                    f"blocked seat {b.seat}: invalid interval board={b.board}, "
+                    f"alight={b.alight} (board must be < alight)"
+                )
+            if b.alight > n:
+                raise ValueError(
+                    f"blocked seat {b.seat}: alight station {b.alight} is out of "
+                    f"range; a trip with {n} station(s) has stations 0..{n}"
+                )
+        return self
+
+
+class SeatAssignment(BaseModel):
+    """The one fixed seat assigned to one passenger."""
+
+    id: PassengerId = Field(description="passenger id (string or integer)")
+    seat: PositiveInt = Field(description="1-based number of the assigned seat")
+
+
+class SeatPlanResponse(BaseModel):
+    assignments: List[SeatAssignment] = Field(
+        description="one fixed seat per passenger, ordered by canonical id "
+                    "(integer ids numerically, then string ids lexicographically); "
+                    "the seat-number sequence is the lexicographically smallest "
+                    "of every feasible complete plan"
+    )

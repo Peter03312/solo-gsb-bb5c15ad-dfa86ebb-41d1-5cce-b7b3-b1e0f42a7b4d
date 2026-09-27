@@ -15,6 +15,9 @@ from .models import (
     ReceiptReconcileResponse,
     RevisionImpactRequest,
     RevisionImpactResponse,
+    SeatAssignment,
+    SeatPlanRequest,
+    SeatPlanResponse,
     SegmentContribution,
     SegmentReceipts,
     SegmentSplit,
@@ -27,6 +30,7 @@ from .models import (
 from .splitter import (
     admit_passengers,
     fare_envelope as compute_fare_envelope,
+    plan_seats,
     reconcile_receipts,
     revision_impact as compute_revision_impact,
     settle_balances,
@@ -35,7 +39,7 @@ from .splitter import (
 
 app = FastAPI(
     title="Carpool Fare Splitter",
-    version="1.2.0",
+    version="1.3.0",
     summary="Split a carpool trip's per-segment costs fairly between passengers.",
 )
 
@@ -221,4 +225,35 @@ def receipt_reconcile(request: ReceiptReconcileRequest) -> ReceiptReconcileRespo
             for j, cost in enumerate(request.segments)
         ],
         totals={str(pid): amount for pid, amount in totals.items()},
+    )
+
+
+@app.post(
+    "/seat-plan",
+    response_model=SeatPlanResponse,
+    responses={
+        409: {"description": "No complete seat plan exists (some passenger "
+                             "cannot be given an allowed, unblocked seat "
+                             "without an overlapping ride sharing it)"},
+        422: {"description": "Invalid request (bad interval, out-of-range "
+                             "station or seat, duplicate passenger id, empty "
+                             "allowed_seats, station_count outside 2..30, "
+                             "seat_count outside 1..6, passenger count "
+                             "outside 1..10, malformed payload, ...)"},
+    },
+)
+def seat_plan(request: SeatPlanRequest) -> SeatPlanResponse:
+    assignments = plan_seats(
+        request.station_count, request.seat_count, request.passengers,
+        request.blocked,
+    )
+    if assignments is None:
+        raise HTTPException(
+            status_code=409,
+            detail="no feasible seat plan: the passengers cannot all be given "
+                   "an allowed, unblocked seat without overlapping rides "
+                   "sharing one seat",
+        )
+    return SeatPlanResponse(
+        assignments=[SeatAssignment(id=pid, seat=seat) for pid, seat in assignments]
     )

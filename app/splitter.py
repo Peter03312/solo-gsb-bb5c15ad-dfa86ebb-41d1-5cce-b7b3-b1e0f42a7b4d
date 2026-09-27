@@ -804,3 +804,111 @@ def reconcile_receipts(segment_costs: List[int], receipts):
         for j in range(n_segments)
     ]
     return [r.id for r in ordered], assignment, segment_receipts
+
+
+# --- seat plan: assign each passenger one fixed seat for their whole ride
+
+
+def plan_seats(station_count: int, seat_count: int, passengers, blocked):
+    """Assign one fixed seat to every passenger for their whole ride.
+
+    ``passengers`` items expose ``id``, ``board``, ``alight`` and
+    ``allowed_seats`` (an iterable of 1-based seat numbers); a passenger
+    occupies segments ``board <= i < alight``. ``blocked`` items expose
+    ``seat``, ``board``, ``alight`` and mark that seat unusable on the
+    half-open segment interval ``[board, alight)``.
+
+    A complete plan assigns each passenger exactly one seat that (a) is in
+    their ``allowed_seats``, (b) is not blocked on any segment they ride, and
+    (c) is not held at the same time by another passenger whose ride overlaps
+    theirs (rides ``[b1, a1)`` and ``[b2, a2)`` overlap iff
+    ``max(b1, b2) < min(a1, a2)``; an alighting passenger frees the seat at
+    the alighting station, so the next passenger may board there immediately).
+
+    Among all complete plans the seat-number sequence over the passengers in
+    canonical :func:`tie_key` order is lexicographically smallest; the result
+    is therefore independent of the request's passenger order.
+
+    Returns a list of ``(id, seat)`` pairs in canonical id order, or ``None``
+    when no complete plan exists. Input ranges/duplicates are the caller's
+    responsibility (validated at the request layer).
+    """
+    ordered = sorted(passengers, key=lambda p: tie_key(p.id))
+    n = len(ordered)
+
+    # Bit i is set for segment i: per seat, its blocked segments; per
+    # passenger, the segments they ride. Seat numbers are 1-based.
+    blocked_mask = [0] * (seat_count + 1)
+    for b in blocked:
+        blocked_mask[b.seat] |= sum(1 << i for i in range(b.board, b.alight))
+
+    ride_mask = [
+        sum(1 << i for i in range(p.board, p.alight)) for p in ordered
+    ]
+    # Allowed seats, deduplicated and ascending, dropping seats blocked at any
+    # point during the passenger's ride.
+    domains = [
+        sorted({
+            s for s in ordered[k].allowed_seats
+            if not (blocked_mask[s] & ride_mask[k])
+        })
+        for k in range(n)
+    ]
+    if any(not domain for domain in domains):
+        return None
+
+    def overlaps(a: int, b: int) -> bool:
+        return bool(ride_mask[a] & ride_mask[b])
+
+    def completable(fixed: List[int]) -> bool:
+        """Whether the partial assignment ``fixed`` (0 = unassigned) extends.
+
+        Minimum-remaining-values backtracking: the unassigned passenger with
+        the fewest currently usable seats is extended next, which is purely a
+        search-order heuristic (it never changes feasibility) and prunes the
+        tiny (at most 10 passengers) search hard.
+        """
+        remaining = [i for i in range(n) if fixed[i] == 0]
+        if not remaining:
+            return True
+        chosen, options = None, None
+        for i in remaining:
+            opts = [
+                s for s in domains[i]
+                if not any(
+                    fixed[j] == s and overlaps(i, j)
+                    for j in range(n) if fixed[j] != 0
+                )
+            ]
+            if not opts:
+                return False
+            if options is None or len(opts) < len(options):
+                chosen, options = i, opts
+                if len(options) == 1:
+                    break
+        for s in options:
+            fixed[chosen] = s
+            if completable(fixed):
+                return True
+            fixed[chosen] = 0
+        return False
+
+    # Canonical-order DFS that tries each passenger's seats in ascending
+    # order and keeps the first branch that extends to a complete plan: the
+    # first success is exactly the lexicographically smallest seat sequence.
+    # The feasibility check mutates a scratch copy so its MRV-order
+    # assignments never leak back into the canonical partial plan.
+    assignment: List[int] = [0] * n
+    for k in range(n):
+        for s in domains[k]:
+            if any(
+                assignment[j] == s and overlaps(k, j) for j in range(k)
+            ):
+                continue
+            assignment[k] = s
+            if completable(list(assignment)):
+                break
+            assignment[k] = 0
+        else:
+            return None
+    return [(ordered[k].id, assignment[k]) for k in range(n)]
