@@ -15,6 +15,7 @@ from app.splitter import (
     _triple,
     admit_passengers,
     fare_envelope,
+    plan_seats,
     reconcile_receipts,
     revision_impact,
     settle_balances,
@@ -25,6 +26,14 @@ from app.splitter import (
 
 def ride(pid, board, alight):
     return P(id=pid, board=board, alight=alight)
+
+
+def seat_rider(pid, board, alight, allowed_seats):
+    return P(id=pid, board=board, alight=alight, allowed_seats=allowed_seats)
+
+
+def seat_block(seat, board, alight):
+    return P(seat=seat, board=board, alight=alight)
 
 
 def cand(pid, board, alight, max_fare):
@@ -869,6 +878,131 @@ class ReconcileReceiptsTests(unittest.TestCase):
                     sum(amount_by_id[rid] for rid in segment_receipts[j]), cost
                 )
         self.assertGreater(feasible, 100)
+
+
+class PlanSeatsTests(unittest.TestCase):
+    def test_single_passenger_takes_smallest_allowed_unblocked(self):
+        result = plan_seats(
+            3, 3,
+            [seat_rider("a", 0, 2, [3, 2])],
+            [seat_block(2, 0, 1)],
+        )
+        # seat 2 blocked on [0,1) which overlaps [0,2); seat 3 is free
+        self.assertEqual(result, [("a", 3)])
+
+    def test_touching_intervals_share_seat_overlapping_do_not(self):
+        self.assertEqual(
+            plan_seats(3, 1, [
+                seat_rider("a", 0, 1, [1]),
+                seat_rider("b", 1, 2, [1]),
+            ], []),
+            [("a", 1), ("b", 1)],
+        )
+        self.assertIsNone(plan_seats(3, 1, [
+            seat_rider("a", 0, 2, [1]),
+            seat_rider("b", 1, 2, [1]),
+        ], []))
+
+    def test_blocked_interval_semantics(self):
+        # blocked [1,3) does not affect a ride [0,1) (touch only)
+        self.assertEqual(
+            plan_seats(4, 1, [seat_rider("a", 0, 1, [1])],
+                       [seat_block(1, 1, 3)]),
+            [("a", 1)],
+        )
+        # blocked [1,3) forbids a ride [2,4) (overlap [2,3))
+        self.assertIsNone(plan_seats(5, 1, [
+            seat_rider("a", 2, 4, [1]),
+        ], [seat_block(1, 1, 3)]))
+
+    def test_lex_min_needs_lookahead(self):
+        # greedy without lookahead would seat a in 1, leaving c (forced to 1,
+        # overlapping a) impossible; the lex-min completion is (2,1,1)
+        result = plan_seats(3, 2, [
+            seat_rider("a", 0, 2, [1, 2]),
+            seat_rider("b", 0, 1, [1, 2]),
+            seat_rider("c", 1, 2, [1]),
+        ], [])
+        self.assertEqual(result, [("a", 2), ("b", 1), ("c", 1)])
+
+    def test_canonical_id_order_independent_of_input_order(self):
+        passengers = [
+            seat_rider("z", 0, 1, [1, 2, 3]),
+            seat_rider(10, 0, 1, [1, 2, 3]),
+            seat_rider(2, 0, 1, [1, 2, 3]),
+        ]
+        for ordering in permutations(passengers):
+            self.assertEqual(
+                plan_seats(2, 3, list(ordering), []),
+                [(2, 1), (10, 2), ("z", 3)],
+            )
+
+    def test_blocked_order_and_duplicates_do_not_matter(self):
+        riders = [seat_rider("a", 0, 3, [1, 2])]
+        blocks_a = [seat_block(1, 0, 2), seat_block(1, 1, 3)]
+        blocks_b = [seat_block(1, 1, 3), seat_block(1, 0, 2),
+                    seat_block(1, 0, 2)]
+        # either way seat 1 is blocked across [0,3): a takes seat 2
+        self.assertEqual(plan_seats(4, 2, riders, blocks_a), [("a", 2)])
+        self.assertEqual(plan_seats(4, 2, riders, blocks_b), [("a", 2)])
+
+    def test_random_against_brute_force(self):
+        import itertools
+
+        def brute(station_count, seat_count, riders, blocks):
+            ordered = sorted(riders, key=lambda p: tie_key(p.id))
+            blocked = [[False] * seat_count for _ in range(station_count)]
+            for blk in blocks:
+                for i in range(blk.board, blk.alight):
+                    blocked[i][blk.seat - 1] = True
+            domains = []
+            for p in ordered:
+                domains.append(sorted(
+                    seat for seat in set(p.allowed_seats)
+                    if not any(blocked[i][seat - 1]
+                               for i in range(p.board, p.alight))
+                ))
+            best = None
+            for combo in itertools.product(*domains):
+                if all(combo[i] != combo[j] or
+                       ordered[i].alight <= ordered[j].board or
+                       ordered[j].alight <= ordered[i].board
+                       for i in range(len(ordered))
+                       for j in range(i + 1, len(ordered))):
+                    if best is None or list(combo) < best:
+                        best = list(combo)
+            return best
+
+        rng = random.Random(77)
+        for _ in range(300):
+            station_count = rng.randint(2, 6)
+            seat_count = rng.randint(1, 4)
+            riders = []
+            used_ids = set()
+            for k in range(rng.randint(1, 6)):
+                board = rng.randint(0, station_count - 2)
+                alight = rng.randint(board + 1, station_count - 1)
+                allowed = rng.sample(
+                    range(1, seat_count + 1), rng.randint(1, seat_count)
+                )
+                pid = k if k % 2 else f"s{k}"
+                if pid in used_ids:
+                    pid = f"t{k}"
+                used_ids.add(pid)
+                riders.append(seat_rider(pid, board, alight, allowed))
+            blocks = []
+            for _ in range(rng.randint(0, 3)):
+                board = rng.randint(0, station_count - 2)
+                alight = rng.randint(board + 1, station_count - 1)
+                blocks.append(seat_block(
+                    rng.randint(1, seat_count), board, alight
+                ))
+            result = plan_seats(station_count, seat_count, riders, blocks)
+            expected = brute(station_count, seat_count, riders, blocks)
+            if expected is None:
+                self.assertIsNone(result)
+            else:
+                self.assertEqual([seat for _, seat in result], expected)
 
 
 if __name__ == "__main__":

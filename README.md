@@ -7,8 +7,11 @@
 按所有修订应用顺序计算每个变动路段对每人应付额的**平均边际影响（Shapley 归因）**；
 当行程中**恰有两段费用未定**时，在各自上下界与全程总价约束下求出目标乘客应付额的
 **精确最小/最大值**及完整费用见证（利用余数周期压缩搜索，绝不逐分遍历）；
-以及用**最多 12 张凭证核销**逐段费用（每张凭证整额归属唯一一个可归属路段，
-多方案时取字典序最小的归属序列），并同时给出逐人应付额。
+用**最多 12 张凭证核销**逐段费用（每张凭证整额归属唯一一个可归属路段，
+多方案时取字典序最小的归属序列），并同时给出逐人应付额；
+以及为 1～10 名乘客**编排固定座位**（每人全程固定一个「允许且未停用」的座位，
+区间重叠者不可同座、下车站可立即换客，多方案时取规范编号顺序下座位编号序列字典序最小者，
+无解返回 409）。
 金额全程使用整数分与精确分数计算，总额严格守恒，且乘客、凭证与付款记录的输入顺序不影响结果。
 
 ## 快速启动
@@ -29,10 +32,11 @@ docker compose up --build
 | http://localhost:8000/revision-impact | 路段费用修订的边际影响归因接口（POST） |
 | http://localhost:8000/fare-envelope | 两段费用未定时的应付额包络接口（POST） |
 | http://localhost:8000/receipt-reconcile | 凭证整额核销 + 分摊接口（POST） |
+| http://localhost:8000/seat-plan | 固定座位编排接口（POST，无解返回 409） |
 | http://localhost:8000/docs | Swagger 交互式文档（各 POST 接口可在此直接发请求） |
 | http://localhost:8000/healthz | 健康检查 |
 
-以上 `/split`、`/admit`、`/settle`、`/revision-impact`、`/fare-envelope`、`/receipt-reconcile` 均为 **POST** 接口，浏览器地址栏直接访问只适用于 GET；命令行可用下文的 `curl` 示例（带 `-d` 请求体即按 POST 发送），或打开 `/docs` 在页面上交互式调用。
+以上 `/split`、`/admit`、`/settle`、`/revision-impact`、`/fare-envelope`、`/receipt-reconcile`、`/seat-plan` 均为 **POST** 接口，浏览器地址栏直接访问只适用于 GET；命令行可用下文的 `curl` 示例（带 `-d` 请求体即按 POST 发送），或打开 `/docs` 在页面上交互式调用。
 
 后台运行可加 `-d`；停止用 `docker compose down`。
 
@@ -465,6 +469,111 @@ curl -s http://localhost:8000/receipt-reconcile \
   -d '{"segments":[100,251,80],"passengers":[{"id":"alice","board":0,"alight":3},{"id":"bob","board":1,"alight":3},{"id":"carol","board":0,"alight":1}],"receipts":[{"id":"R-251","amount":251,"segments":[1]},{"id":"R-100b","amount":40,"segments":[0,2]},{"id":"R-80a","amount":40,"segments":[0,2]},{"id":"R-80b","amount":40,"segments":[0,2]},{"id":"R-100a","amount":60,"segments":[0,2]}]}'
 ```
 
+## API：`POST /seat-plan`
+
+为一辆有 `seat_count` 个座位的车编排固定座位。线路有 `station_count` 个站点，编号
+`0..station_count-1`（相邻两站之间为一段）。1～10 名乘客各自给出与 `/split`
+**完全相同的上下车区间约定**：在车区间为半开区间 `[board, alight)`，即站点 `board`
+上车、站点 `alight` 下车，须满足 `0 ≤ board < alight ≤ station_count-1`。
+
+每名乘客另给非空 `allowed_seats`（座位编号，1-based，范围 `1..seat_count`，重复编号无害）。
+另有可选 `blocked` 列表，每项含 `seat`、`board`、`alight`，表示该座位在半开区间
+`[board, alight)` 内停用（区间规则与乘客相同，`alight ≤ station_count-1`）。
+
+编排规则：
+
+1. 每名乘客**全程固定一个**座位，该座位必须：
+   - 在其 `allowed_seats` 内；且
+   - 在乘客在车的任一段上**未被停用**（乘客区间与停用区间只要有一段重叠即不可用；仅端点相接不算重叠）。
+2. **区间重叠的两名乘客不得同座**；区间仅在站点处相接（一人的 `alight` = 另一人的 `board`）
+   时可以同座——**下车站即可立即换客**。
+3. 全员都能安排时，先把乘客按**规范编号顺序**排列（整数 ID 按数值升序、排在字符串 ID 前，
+   字符串按字典序升序），再在所有完整方案中取**座位编号序列字典序最小**者。
+4. 因此乘客与 `blocked` 项在请求中的排列顺序不影响结果。
+5. 不存在完整方案时返回 **409 Conflict**；非法区间、重复乘客编号、越界座位、
+   数量越界（`station_count` 须为 2～30、`seat_count` 须为 1～6、乘客 1～10 名）
+   或载荷格式错误返回 **422**。
+
+### 请求体
+
+```json
+{
+  "station_count": 3,
+  "seat_count": 2,
+  "passengers": [
+    {"id": "a", "board": 0, "alight": 2, "allowed_seats": [1, 2]},
+    {"id": "b", "board": 0, "alight": 1, "allowed_seats": [1, 2]}
+  ],
+  "blocked": [
+    {"seat": 1, "board": 0, "alight": 1}
+  ]
+}
+```
+
+上例中 1 号座在第 0 段停用：`b` 与停用区间重叠不能坐 1 号座，改坐 2 号座；
+`a` 虽与停用区间也重叠，但还可坐 2 号座——此时 `a`、`b` 在第 0 段重叠，不能同坐 2 号座，
+故整体无解（409）。把停用区间改为只在 `[1,2)` 停用（或把 `blocked` 去掉）则有解。
+
+合法示例与响应：
+
+```json
+// 请求
+{
+  "station_count": 3,
+  "seat_count": 2,
+  "passengers": [
+    {"id": "a", "board": 0, "alight": 1, "allowed_seats": [1, 2]},
+    {"id": "b", "board": 0, "alight": 2, "allowed_seats": [1, 2]},
+    {"id": "c", "board": 1, "alight": 2, "allowed_seats": [1, 2]}
+  ]
+}
+// 响应 200
+{
+  "assignments": [
+    {"id": "a", "seat": 1},
+    {"id": "b", "seat": 2},
+    {"id": "c", "seat": 1}
+  ]
+}
+```
+
+- `assignments`：逐乘客一项，按规范编号顺序排列；`seat` 为该乘客全程固定的 1-based 座位号。
+- 上例：`a` 坐 1 号座只乘第 0 段；`b` 全程与 `a` 重叠故坐 2 号座；`c` 在站点 1 上车时
+  `a` 已下车，于是**立即接续 1 号座**，座位序列 `(a,b,c) = (1,2,1)` 为字典序最小完整方案。
+
+### 无解示例（409）
+
+```json
+// 请求：两名乘客区间完全重叠，却都只允许坐 1 号座
+{
+  "station_count": 2,
+  "seat_count": 1,
+  "passengers": [
+    {"id": "a", "board": 0, "alight": 1, "allowed_seats": [1]},
+    {"id": "b", "board": 0, "alight": 1, "allowed_seats": [1]}
+  ]
+}
+// 响应 409
+{"detail": "no feasible seat plan: ..."}
+```
+
+乘客唯一允许的座位在其在车区间内被停用（或部分重叠地停用）同样返回 409。
+
+### 算法：规范顺序逐位贪心 + 记忆化可行性回溯
+
+按规范编号顺序处理乘客，每个位置**从小号座位开始尝试**，并用一个带记忆化的回溯判定
+（MRV 最小剩余值选座 + 前向检查：某未分配乘客已无可用座位立即剪枝）确认当前选择能否补全；
+第一个能补全的座位即被固定。因此首位一旦确定便不再回退，最终序列严格为字典序最小。
+规模至多 10 名乘客、6 个座位，状态空间很小，响应即时。
+
+### 示例
+
+```bash
+curl -s http://localhost:8000/seat-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"station_count":3,"seat_count":2,"passengers":[{"id":"a","board":0,"alight":1,"allowed_seats":[1,2]},{"id":"b","board":0,"alight":2,"allowed_seats":[1,2]},{"id":"c","board":1,"alight":2,"allowed_seats":[1,2]}]}'
+```
+
 ## 分摊规则
 
 1. 按路段顺序处理，每段找出全部在车乘客均摊：`base = cost // n`，余数 `r = cost % n`。
@@ -473,7 +582,7 @@ curl -s http://localhost:8000/receipt-reconcile \
    （整数 ID 按数值、字符串 ID 按字典序），除此之外 ID 不影响分摊。
 4. 因此：总额严格守恒（`sum(totals) == sum(segments)`），且乘客在请求中的排列顺序不影响结果。
 
-## 错误（422）
+## 错误：422 与 409
 
 以下情况返回 `422 Unprocessable Entity`，响应 `detail` 中含具体原因：
 
@@ -496,7 +605,17 @@ curl -s http://localhost:8000/receipt-reconcile \
 - （仅 `/receipt-reconcile`）凭证的可归属路段下标越界（`>= 路段数` 或为负）；
 - （仅 `/receipt-reconcile`）凭证金额之和不等于行程总额；
 - （仅 `/receipt-reconcile`）总额虽相符，但不存在「每张凭证整额归属一个允许路段、
-  每段所获金额恰好等于其费用」的核销方案。
+  每段所获金额恰好等于其费用」的核销方案；
+- （仅 `/seat-plan`）`station_count` 不在 2～30、`seat_count` 不在 1～6，
+  或乘客数不在 1～10；
+- （仅 `/seat-plan`）乘客或停用区间非法（`board >= alight`、`alight > station_count-1`、
+  站点为负）、乘客 ID 重复、`allowed_seats` 为空或含 `1..seat_count` 之外的座位号，
+  或 `blocked` 项的座位号越界、停用区间非法；
+- （仅 `/seat-plan`）含未知字段、字段缺失或类型错误。
+
+`POST /seat-plan` 另有 **409 Conflict**：输入完全合法、但**不存在可行座位方案**
+（例如某乘客的所有允许座位在其在车区间内均被停用，或区间重叠的乘客无法分散到各自允许的座位）。
+422 表示输入本身非法，409 表示「合法但排不下」，两者严格区分。
 
 ## 本地开发与测试
 
@@ -512,9 +631,9 @@ uvicorn app.main:app --reload    # 本地起服务，默认 http://127.0.0.1:800
 
 ```
 app/
-  main.py       # FastAPI 应用与路由（POST /split、/admit、/settle、/revision-impact、/fare-envelope、/receipt-reconcile、GET /healthz）
+  main.py       # FastAPI 应用与路由（POST /split、/admit、/settle、/revision-impact、/fare-envelope、/receipt-reconcile、/seat-plan、GET /healthz）
   models.py     # 请求/响应模型与 422 校验规则
-  splitter.py   # 核心算法：分摊（精确分数）+ 候选遴选（子集枚举）+ 最少转账结清（子集 DP）+ 修订影响（Shapley 平均边际）+ 费用包络（余数周期压缩）+ 凭证核销（从左到右子集 DP）
+  splitter.py   # 核心算法：分摊（精确分数）+ 候选遴选（子集枚举）+ 最少转账结清（子集 DP）+ 修订影响（Shapley 平均边际）+ 费用包络（余数周期压缩）+ 凭证核销（从左到右子集 DP）+ 座位编排（贪心 + 记忆化可行性回溯）
 tests/          # 算法单元测试 + API 集成测试
 Dockerfile      # 依赖与启动命令均固化在镜像内
 compose.yaml    # 单服务编排，含健康检查

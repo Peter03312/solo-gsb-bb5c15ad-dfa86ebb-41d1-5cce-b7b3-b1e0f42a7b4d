@@ -12,7 +12,7 @@ from fractions import Fraction
 from functools import lru_cache
 from itertools import combinations
 from math import factorial, gcd as _gcd
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 def tie_key(passenger_id) -> tuple:
@@ -683,6 +683,126 @@ def _optimal_transfers(nonzero: List[Tuple]) -> List[Tuple]:
         (frm, to, amount)
         for frm, to, amount in sorted(partition(full), key=_triple)
     ]
+
+
+# --- seat plan: assign every passenger one fixed, allowed, unblocked seat ---
+
+
+def plan_seats(station_count: int, seat_count: int, passengers, blocked):
+    """Assign one fixed seat to every passenger for their whole ride.
+
+    Stations are ``0..station_count-1``; a passenger occupies the segments
+    ``board <= i < alight`` (same half-open interval convention as
+    :func:`split_fares`). A seat is usable for a passenger only when it is
+    both in the passenger's non-empty ``allowed_seats`` list (1-based seat
+    numbers) and not covered by a blocked record ``(seat, board, alight)``
+    whose half-open interval overlaps the passenger's ride. Two passengers
+    whose ride intervals overlap may never share a seat; intervals merely
+    touching at a station may share one (an alighting passenger frees the
+    seat immediately for the next rider).
+
+    Among all complete plans, the lexicographically smallest seat-number
+    sequence is returned, with the passengers ordered by :func:`tie_key`
+    (integer ids numerically first, then string ids lexicographically).
+    Returns ``None`` when no complete plan exists. The input order of
+    passengers and blocked records never affects the result.
+
+    ``passengers`` items expose ``id``, ``board``, ``alight`` and
+    ``allowed_seats``; ``blocked`` items expose ``seat``, ``board`` and
+    ``alight``. Returns a list of ``(id, seat)`` pairs in canonical id
+    order, with 1-based seat numbers.
+    """
+    ordered = sorted(passengers, key=lambda p: tie_key(p.id))
+    m = len(ordered)
+
+    # Per passenger, a bitmask of the segments [board, alight) they occupy.
+    ride_mask = [
+        sum(1 << i for i in range(p.board, p.alight)) for p in ordered
+    ]
+    # Per 1-based seat, a bitmask of the segments it is blocked on.
+    blocked_mask = [0] * (seat_count + 1)
+    for b in blocked:
+        for i in range(b.board, b.alight):
+            blocked_mask[b.seat] |= 1 << i
+
+    # free_options[k]: bitmask of 0-based seats passenger k may use at all,
+    # i.e. allowed seats that are not blocked anywhere on their ride.
+    free_options = []
+    for k, p in enumerate(ordered):
+        options = 0
+        for seat in set(p.allowed_seats):
+            if blocked_mask[seat] & ride_mask[k]:
+                continue
+            options |= 1 << (seat - 1)
+        free_options.append(options)
+
+    overlap = [[False] * m for _ in range(m)]
+    for i in range(m):
+        for j in range(i + 1, m):
+            if ride_mask[i] & ride_mask[j]:
+                overlap[i][j] = overlap[j][i] = True
+
+    @lru_cache(maxsize=None)
+    def feasible(choices) -> bool:
+        """Whether a consistent partial assignment extends to a full one.
+
+        ``choices[k]`` is the 0-based seat of an already fixed passenger or
+        ``None`` while undecided. The next passenger is chosen by the
+        minimum-remaining-values heuristic (forced, one-option passengers
+        first); forward checking rejects a state as soon as some undecided
+        passenger has no seat left.
+        """
+        best_k = -1
+        best_options = 0
+        for k in range(m):
+            if choices[k] is not None:
+                continue
+            options = free_options[k]
+            for j in range(m):
+                seat = choices[j]
+                if seat is not None and overlap[k][j]:
+                    options &= ~(1 << seat)
+            if options == 0:
+                return False
+            if best_k == -1 or options.bit_count() < best_options.bit_count():
+                best_k, best_options = k, options
+                if best_options.bit_count() == 1:
+                    break
+        if best_k == -1:
+            return True
+        options = best_options
+        while options:
+            bit = options & -options
+            options ^= bit
+            nxt = list(choices)
+            nxt[best_k] = bit.bit_length() - 1
+            if feasible(tuple(nxt)):
+                return True
+        return False
+
+    # Fix passengers in canonical id order, always trying seat numbers
+    # ascending and keeping the choice iff a completion exists: the first
+    # full sequence reached this way is the lexicographically smallest one.
+    choices: List[Optional[int]] = [None] * m
+    for k in range(m):
+        used = 0
+        for j in range(k):
+            if overlap[k][j]:
+                used |= 1 << choices[j]
+        options = free_options[k] & ~used
+        while options:
+            bit = options & -options
+            options ^= bit
+            seat = bit.bit_length() - 1
+            trial = choices.copy()
+            trial[k] = seat
+            if feasible(tuple(trial)):
+                choices[k] = seat
+                break
+        else:
+            return None
+
+    return [(ordered[k].id, choices[k] + 1) for k in range(m)]
 
 
 # --- receipt reconciliation: attribute every receipt, whole, to one segment

@@ -10,7 +10,15 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field, NonNegativeInt, PositiveInt, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    NonNegativeInt,
+    PositiveInt,
+    field_validator,
+    model_validator,
+)
 
 PassengerId = Union[str, int]
 
@@ -530,4 +538,135 @@ class ReceiptReconcileResponse(BaseModel):
     totals: Dict[str, NonNegativeInt] = Field(
         description="cents each passenger owes under the usual /split rules; "
                     "sums to total_cost"
+    )
+
+
+# --- seat plan: one fixed, allowed, unblocked seat per passenger
+
+
+class SeatPlanPassenger(BaseModel):
+    """One passenger's ride and the seats they are willing to occupy."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: PassengerId = Field(description="unique passenger id (string or integer)")
+    board: NonNegativeInt = Field(description="station index where the passenger boards")
+    alight: NonNegativeInt = Field(description="station index where the passenger alights")
+    allowed_seats: List[PositiveInt] = Field(
+        min_length=1,
+        description="non-empty list of 1-based seat numbers the passenger "
+                    "may occupy; the assigned seat must be one of these and "
+                    "not blocked for any segment of their ride; repeats are harmless",
+    )
+
+    @field_validator("allowed_seats")
+    @classmethod
+    def _dedupe_allowed_seats(cls, seats: List[int]) -> List[int]:
+        # Keep first-seen order; only seat numbers matter downstream.
+        seen = set()
+        unique = []
+        for seat in seats:
+            if seat not in seen:
+                seen.add(seat)
+                unique.append(seat)
+        return unique
+
+
+class SeatBlock(BaseModel):
+    """A seat taken out of service on the half-open interval [board, alight)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    seat: PositiveInt = Field(description="1-based seat number that is blocked")
+    board: NonNegativeInt = Field(description="first station of the blocked interval")
+    alight: NonNegativeInt = Field(description="first station after the blocked interval")
+
+
+class SeatPlanRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    station_count: PositiveInt = Field(
+        ge=2,
+        le=30,
+        description="number of stations on the line, numbered 0..station_count-1; "
+                    "segments run between consecutive stations",
+    )
+    seat_count: PositiveInt = Field(
+        ge=1,
+        le=6,
+        description="number of seats on the vehicle, numbered 1..seat_count",
+    )
+    passengers: List[SeatPlanPassenger] = Field(
+        min_length=1,
+        max_length=10,
+        description="1 to 10 passengers, each with a fixed ride interval and "
+                    "non-empty allowed-seats list",
+    )
+    blocked: List[SeatBlock] = Field(
+        default_factory=list,
+        description="optional seat outages; each disables its 1-based seat on "
+                    "the half-open interval [board, alight)",
+    )
+
+    @model_validator(mode="after")
+    def _check_seat_plan(self) -> "SeatPlanRequest":
+        last_station = self.station_count - 1
+        seen = set()
+        for p in self.passengers:
+            key = str(p.id)
+            if key in seen:
+                raise ValueError(f"duplicate passenger id: {p.id!r}")
+            seen.add(key)
+            if p.board >= p.alight:
+                raise ValueError(
+                    f"passenger {p.id!r}: invalid interval board={p.board}, "
+                    f"alight={p.alight} (board must be < alight)"
+                )
+            if p.alight > last_station:
+                raise ValueError(
+                    f"passenger {p.id!r}: alight station {p.alight} is out of range; "
+                    f"a line with {self.station_count} station(s) has stations "
+                    f"0..{last_station}"
+                )
+            for seat in p.allowed_seats:
+                if seat > self.seat_count:
+                    raise ValueError(
+                        f"passenger {p.id!r}: allowed seat {seat} is out of range; "
+                        f"seats are numbered 1..{self.seat_count}"
+                    )
+        for b in self.blocked:
+            if b.seat > self.seat_count:
+                raise ValueError(
+                    f"blocked seat {b.seat} is out of range; "
+                    f"seats are numbered 1..{self.seat_count}"
+                )
+            if b.board >= b.alight:
+                raise ValueError(
+                    f"blocked seat {b.seat}: invalid interval board={b.board}, "
+                    f"alight={b.alight} (board must be < alight)"
+                )
+            if b.alight > last_station:
+                raise ValueError(
+                    f"blocked seat {b.seat}: alight station {b.alight} is out of "
+                    f"range; a line with {self.station_count} station(s) has "
+                    f"stations 0..{last_station}"
+                )
+        return self
+
+
+class SeatAssignment(BaseModel):
+    """One passenger's assigned seat."""
+
+    id: PassengerId = Field(description="passenger id")
+    seat: PositiveInt = Field(
+        description="1-based seat number assigned for the passenger's whole ride"
+    )
+
+
+class SeatPlanResponse(BaseModel):
+    assignments: List[SeatAssignment] = Field(
+        description="one entry per passenger in canonical id order "
+                    "(integer ids numerically, then string ids lexicographically); "
+                    "the seat-number sequence is lexicographically smallest among "
+                    "all complete plans"
     )
